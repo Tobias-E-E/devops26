@@ -76,7 +76,7 @@ jobs:
         # Needed if the packages are private (the default for a new package —
         # see README). Public packages pull fine without this, but leaving it
         # in means the pipeline works either way.
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
