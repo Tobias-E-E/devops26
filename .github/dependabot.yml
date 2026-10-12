@@ -1,0 +1,75 @@
+# Spar C gate #3: Dependabot.
+#
+# Reference file — not shipped in the template repo. Present, it opens
+# version-bump pull requests in every student repo from week one, and a bump
+# that breaks the test suite is a red check the student did not cause. Copy
+# it to .github/dependabot.yml when you start the track.
+#
+# Trivy and CodeQL tell you that you have a problem. Dependabot is the only
+# one of the three that arrives with the fix already written - it opens a
+# pull request against the pinned version, and that PR runs through lint,
+# tests, and the Trivy gate like any other change. That is the whole point:
+# it turns "someone should upgrade this eventually" into a reviewable diff
+# sitting in the PR list, where ignoring it is a visible choice.
+#
+# Note the ordering it creates. Dependabot ideally opens the PR *before*
+# Trivy ever fails, because Dependabot reacts to a new release while Trivy
+# reacts to a published CVE. When the pipeline is working, the boring
+# version-bump PR you merged last Tuesday is the reason the gate never went
+# red.
+version: 2
+
+updates:
+  # Python dependencies. Directory points at where requirements.txt lives,
+  # not the repo root - Dependabot finds nothing if this is wrong, and it
+  # fails silently by simply never opening a PR. Check
+  # Insights -> Dependency graph -> Dependabot in the GitHub UI to confirm
+  # each ecosystem below is actually being checked.
+  - package-ecosystem: pip
+    directory: "/backend"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security]
+    commit-message:
+      prefix: "deps"
+
+  # Base images. This is the one people forget. `python:3.12-slim` and
+  # `nginxinc/nginx-unprivileged:alpine` are moving tags - the OS packages
+  # inside them get CVEs
+  # like anything else, and Trivy scans them (the "debian 13.6" section in
+  # the scan output). Without this entry the base image silently rots.
+  - package-ecosystem: docker
+    directory: "/backend"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, security]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: docker
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, security]
+    commit-message:
+      prefix: "deps"
+
+  # The workflows themselves. A third-party action runs with access to your
+  # repository and your secrets, which makes `uses: some/action@v1` a
+  # supply-chain dependency in the most literal sense - it is code from a
+  # stranger executing inside your pipeline. Keeping actions updated is the
+  # cheap half of managing that; pinning them to a full commit SHA instead
+  # of a moving tag is the thorough half (a tag can be re-pointed at new
+  # code by whoever owns the action).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, security]
+    commit-message:
+      prefix: "ci"

@@ -1,0 +1,68 @@
+name: SSH deploy
+description: >
+  Pull and restart the app's docker compose stack on a cPouta VM over SSH.
+  Extracted from the M9 deploy workflow so that the dev and prod jobs in
+  deploy.yml run byte-identical steps and differ only in which environment's
+  configuration they are handed. If deploying to prod could take a different
+  code path than deploying to dev, then dev stops being a test of prod - and
+  a dev environment that doesn't predict prod is just a second thing to
+  maintain.
+
+inputs:
+  user:
+    description: SSH user on the target VM.
+    required: true
+  host:
+    description: Floating IP or hostname of the target VM.
+    required: true
+  known_hosts:
+    description: >
+      Pre-pinned host key line for the target (`ssh-keyscan -H <ip>`). Set per
+      environment - dev and prod are different machines with different host
+      keys.
+    required: true
+  ssh_key:
+    description: Private deploy key, passed in from an environment secret.
+    required: true
+  compose_file:
+    description: Path to the app's docker-compose.yml on the VM.
+    required: false
+    default: /opt/app/docker-compose.yml
+
+runs:
+  using: composite
+  steps:
+    - name: Configure SSH (deploy key + pinned host key)
+      # Inputs flow through env: below, not inline ${{ }} inside the script -
+      # keeps them out of the literal command text (no shell-quoting or
+      # injection surprises) and makes the script copy-pasteable for
+      # debugging without leaking anything.
+      #
+      # Host key verification: known_hosts is pinned ahead of time by a human
+      # (`ssh-keyscan -H <floating-ip>`, pasted into the environment's
+      # DEPLOY_KNOWN_HOSTS variable - see README). Writing it before the ssh
+      # call lets us use StrictHostKeyChecking=yes below. NEVER
+      # StrictHostKeyChecking=no - that disables server authentication
+      # entirely and accepts any host silently (MITM-able).
+      shell: bash
+      env:
+        DEPLOY_SSH_KEY: ${{ inputs.ssh_key }}
+        DEPLOY_KNOWN_HOSTS: ${{ inputs.known_hosts }}
+      run: |
+        set -euo pipefail
+        mkdir -p ~/.ssh
+        install -m 600 /dev/null ~/.ssh/deploy_key
+        printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+        printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+    - name: Deploy (pull + restart stack)
+      shell: bash
+      env:
+        DEPLOY_USER: ${{ inputs.user }}
+        DEPLOY_HOST: ${{ inputs.host }}
+        COMPOSE_FILE: ${{ inputs.compose_file }}
+      run: |
+        set -euo pipefail
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+          "$DEPLOY_USER@$DEPLOY_HOST" \
+          "docker compose -f $COMPOSE_FILE pull && docker compose -f $COMPOSE_FILE up -d"
