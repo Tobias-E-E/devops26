@@ -62,3 +62,13 @@ variable "availability_zone" {
   type        = string
   default     = null
 }
+
+variable "environment" {
+  description = "dev or prod. Must match the selected Terraform workspace (see the precondition in main.tf)."
+  type        = string
+
+  validation {
+    condition     = contains(["dev", "prod"], var.environment)
+    error_message = "environment must be exactly \"dev\" or \"prod\"."
+  }
+}
