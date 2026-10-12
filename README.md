@@ -350,3 +350,5 @@ den hittbar.
 - [ ] **M9 — CD:** merge till main deployar automatiskt via Actions. Tagg: `m9-cd`
 
 Se `kursplan.md` (i kursrepot) för fullständig beskrivning av varje milstolpe.
+
+<!-- ruleset check -->
