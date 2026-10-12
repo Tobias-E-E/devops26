@@ -61,7 +61,7 @@ jobs:
       matrix:
         image: [backend, frontend]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Lowercase repository owner
         # Same step as in publish-images.yml, for the same reason: GHCR
@@ -115,7 +115,7 @@ jobs:
       name: dev
       url: ${{ vars.APP_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/ssh-deploy
         with:
@@ -140,7 +140,7 @@ jobs:
       name: dev
       url: ${{ vars.APP_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -182,7 +182,7 @@ jobs:
       name: prod
       url: ${{ vars.APP_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/ssh-deploy
         with:
