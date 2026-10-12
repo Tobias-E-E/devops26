@@ -1,0 +1,114 @@
+name: Security scan
+
+# Spar C gate #1 (fast feedback): scan both images for known CVEs on every
+# pull request, before anything is merged or published. This is the gate a
+# student's "add a vulnerable dependency" demo hits first.
+#
+# Reference file — not shipped in the template repo. The base course has no
+# security milestone, so in a template this would put a red check nobody has
+# been taught to read on every PR from week one. Copy it to
+# .github/workflows/security.yml when you start the track; see README.md in
+# this directory.
+#
+# There is a SECOND Trivy gate in deploy.yml, which scans the images that
+# were actually published to GHCR before they are deployed. That is not
+# redundant: this workflow scans an image built *from the PR branch*, while
+# deploy.yml scans the artifact that is about to reach a real machine. A
+# direct push to main skips PRs entirely - deploy.yml is what still stops
+# it. Defense in depth: the cheap gate catches almost everything early, the
+# late gate is the one that cannot be walked around.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  # Needed to upload the SARIF report into the repo's Security tab
+  # ("Code scanning alerts"). Without this the upload step fails.
+  security-events: write
+
+jobs:
+  trivy:
+    name: Trivy image scan (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      # fail-fast: false so a finding in the backend still lets the frontend
+      # scan finish. You want the full picture in one run, not a
+      # fix-one-rerun-find-another loop.
+      fail-fast: false
+      matrix:
+        include:
+          - image: backend
+            context: ./backend
+          - image: frontend
+            context: ./frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        # Built locally and never pushed - a scan that runs only after
+        # publishing is a scan that tells you about a vulnerability you have
+        # already handed to everyone who pulls the tag.
+        run: docker build -t local/${{ matrix.image }}:${{ github.sha }} ${{ matrix.context }}
+
+      # Two Trivy runs on purpose. They are NOT the same scan twice:
+      #
+      #   1. Report run  - every severity, exit-code 0, SARIF out. This never
+      #      fails the build; its job is to put the full picture in the
+      #      Security tab so MEDIUM/LOW findings are visible and trackable
+      #      even though they don't block.
+      #   2. Gate run    - HIGH,CRITICAL only, exit-code 1. This is the one
+      #      that blocks the merge.
+      #
+      # Splitting them is what lets "we see everything" and "we block on
+      # little" both be true at once. If the gate run came first and failed,
+      # the SARIF would never upload and you would lose the report exactly
+      # when you most need it - hence report first, and `if: always()` on the
+      # upload.
+      - name: Trivy report (all severities, never fails)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: local/${{ matrix.image }}:${{ github.sha }}
+          scanners: vuln
+          format: sarif
+          output: trivy-${{ matrix.image }}.sarif
+          exit-code: "0"
+
+      - name: Upload report to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-${{ matrix.image }}.sarif
+          # Without a category the two matrix legs overwrite each other's
+          # results and you only ever see one image's findings.
+          category: trivy-${{ matrix.image }}
+
+      - name: Trivy gate (HIGH + CRITICAL block the build)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: local/${{ matrix.image }}:${{ github.sha }}
+          scanners: vuln
+          format: table
+          exit-code: "1"
+          # Why HIGH,CRITICAL and not everything: see security/README.md.
+          # Short version - a gate that fires on every MEDIUM gets switched
+          # off within a month, and a gate that is switched off protects
+          # nothing.
+          severity: HIGH,CRITICAL
+          # Why ignore-unfixed: a vulnerability with no released patch cannot
+          # be acted on by the person whose PR is being blocked. Their only
+          # available move is to disable the gate. Findings WITH a fix are
+          # exactly the ones a developer can resolve, so those are the ones
+          # we block on. See security/README.md - this flag is a scoping
+          # decision, not a way to make the scan quieter.
+          ignore-unfixed: true
+          trivyignores: .trivyignore.yaml
+        env:
+          # Trivy's vulnerability DB is served from GHCR and is rate-limited
+          # for anonymous pulls. Authenticating with the run's own token
+          # avoids the intermittent "TOOMANYREQUESTS" failures that otherwise
+          # look like flaky security gates - and a security gate that fails
+          # at random is a security gate people start ignoring.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,77 @@
+name: CodeQL
+
+# Spar C gate #2: static analysis of OUR OWN code.
+#
+# Reference file — not shipped in the template repo, for the same reason as
+# security.yml, plus one of its own: on a private repo without GitHub
+# Advanced Security the SARIF upload fails outright, so the check is red for
+# a reason the person whose PR it blocks cannot fix. Copy it to
+# .github/workflows/codeql.yml when you start the track.
+#
+# Trivy and CodeQL are often lumped together as "the security scanners".
+# They answer completely different questions and neither substitutes for
+# the other:
+#
+#   Trivy  — "does this image contain a dependency with a KNOWN CVE?"
+#            Someone else's bug, already public, already has a number and
+#            usually a patch. Lookup against a database.
+#   CodeQL — "does the code WE wrote contain an exploitable pattern?"
+#            Our bug, nobody has ever seen it, no CVE will ever exist for
+#            it. Dataflow analysis: it tracks untrusted input from a source
+#            (a request parameter) to a sink (a query, a file path, a shell
+#            command) and reports the path.
+#
+# A repo with only Trivy ships hand-written SQL injection with a green
+# pipeline. A repo with only CodeQL ships a five-year-old vulnerable
+# urllib3 with a green pipeline.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, independent of commits. CodeQL's query packs improve over
+    # time, so the same unchanged code can become a finding months later -
+    # a repo that only scans on push stops being scanned the moment it
+    # stops changing, which is exactly when nobody is watching it.
+    - cron: "17 4 * * 1"
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      # Required for private repos so CodeQL can read workflow run data.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both halves of the app. javascript-typescript covers frontend/app.js
+        # even though it is plain vanilla JS with no build step.
+        language: [python, javascript-typescript]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          # security-extended adds precision-medium queries on top of the
+          # default set: more real findings, and more noise. That trade is
+          # right for this repo because the codebase is small enough to
+          # triage by hand. On a large legacy codebase, starting with
+          # security-extended usually means starting with 400 alerts nobody
+          # reads - start with the default suite there and widen later.
+          queries: security-extended
+
+      # No build step: Python and JavaScript are interpreted, so CodeQL
+      # builds its database straight from the source. A compiled language
+      # (Java, Go, C#) would need `autobuild` or an explicit build here -
+      # CodeQL can only analyse code it watched being compiled.
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

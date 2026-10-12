@@ -1,66 +1,197 @@
 name: Deploy to VM
 
-# Reference CD workflow (M9): after "Publish images" (see
-# publish-images.yml) has built and pushed new
-# images to GHCR on a push to main, this workflow SSHes into the cPouta
-# VM and pulls + restarts the stack. Deliberately simple push-model
-# deploy — see the "CD: automatisk deploy till VM (M9)" README section
-# for the weaknesses discussion this is meant to seed (GitOps, session 9).
+# Reference CD workflow — M9 (single environment) grown into the Spar C
+# release pipeline (dev -> integration test -> prod behind an approval gate).
 #
-# Why workflow_run instead of `on: push: branches: [main]` directly: a
-# plain push trigger on this workflow would fire in parallel with
-# "Publish images" (same push event) and could SSH in and `pull` BEFORE
-# the new image even exists in GHCR. Chaining on workflow_run against
-# "Publish images" completing makes the ordering explicit — this job
-# only starts once that workflow has finished, and only proceeds
-# (`if:` below) if it succeeded.
+# After "Publish images" (see publish-images.yml) has built and pushed new
+# images to GHCR on a push to main, this workflow walks them through four
+# stages. Nothing reaches prod that has not passed all three gates before it:
+#
+#   scan-images       Trivy against the images that were actually PUBLISHED.
+#   deploy-dev        Environment "dev". No approval — this is the fast lane.
+#   integration-test  Black-box HTTP tests against the running dev app.
+#   deploy-prod       Environment "prod". Blocks on a human clicking approve.
+#
+# Why workflow_run instead of `on: push: branches: [main]` directly: a plain
+# push trigger would fire in parallel with "Publish images" (same push event)
+# and could SSH in and `pull` BEFORE the new image even exists in GHCR.
+# Chaining on workflow_run makes the ordering explicit — this only starts
+# once that workflow has finished, and only proceeds if it succeeded.
 on:
   workflow_run:
     workflows: ["Publish images"]
     types: [completed]
     branches: [main]
 
-# Least-privilege GITHUB_TOKEN: this workflow only opens an outbound SSH
-# connection — it doesn't need to read or write anything in the repo or
-# registry, so the default token permissions are trimmed to the minimum
-# GitHub allows (contents: read is the floor; there is no "none").
+# Least-privilege GITHUB_TOKEN: these jobs open an outbound SSH connection
+# and read public GHCR images — nothing needs write access to the repo, so
+# the default token permissions are trimmed to the minimum GitHub allows
+# (contents: read is the floor; there is no "none").
 permissions:
   contents: read
 
+env:
+  # Both images are tagged with the commit SHA by publish-images.yml. The
+  # workflow_run event carries the SHA of the commit that triggered the
+  # upstream run, and scan-images scans exactly that tag — so the scan is
+  # pinned to the commit being released. The VMs, however, still run
+  # `:latest` (cloud-init wrote that tag into /opt/app/docker-compose.yml),
+  # and the deploy jobs only run `compose pull` + `up -d`. If another merge
+  # lands while deploy-prod waits for approval, prod pulls a newer `latest`
+  # than the one dev tested. That is a known weakness, not a guarantee —
+  # see the honest-weakness note in the lab (Spår C, step 6).
+  IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+
 jobs:
-  deploy:
-    name: SSH deploy to cPouta VM
+  # ------------------------------------------------------------------
+  # Gate 1 — supply chain. Scans the PUBLISHED artifact.
+  # ------------------------------------------------------------------
+  scan-images:
+    name: Trivy scan of published images
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
-    env:
-      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
-      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-      DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
-      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+    permissions:
+      contents: read
+      # Read-only on packages: this job pulls the published image to scan it
+      # and must never be able to overwrite a tag. The deploy jobs below get
+      # neither — they only open SSH connections.
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [backend, frontend]
     steps:
-      - name: Configure SSH (deploy key + pinned host key)
-        # Secrets/vars flow through env: above, not inline ${{ }} inside
-        # the script below — keeps them out of the literal command text
-        # (no shell-quoting/injection surprises) and makes the script
-        # itself copy-pasteable for debugging without leaking anything.
-        #
-        # Host key verification: DEPLOY_KNOWN_HOSTS is pinned ahead of
-        # time by a human (`ssh-keyscan -H <floating-ip>`, pasted into
-        # the DEPLOY_KNOWN_HOSTS repo variable — see README). Writing it
-        # to known_hosts before the ssh call lets us use
-        # StrictHostKeyChecking=yes below. NEVER
-        # StrictHostKeyChecking=no — that disables server authentication
-        # entirely and accepts any host silently (MITM-able).
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          install -m 600 /dev/null ~/.ssh/deploy_key
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
 
-      - name: Deploy (pull + restart stack)
-        run: |
-          set -euo pipefail
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
-            "$DEPLOY_USER@$DEPLOY_HOST" \
-            'docker compose -f /opt/app/docker-compose.yml pull && docker compose -f /opt/app/docker-compose.yml up -d'
+      - name: Lowercase repository owner
+        # Same step as in publish-images.yml, for the same reason: GHCR
+        # rejects uppercase in a namespace, and GitHub usernames may contain
+        # it. The reference must be byte-identical to the tag that workflow
+        # pushed, or the scan silently pulls nothing and fails on "image not
+        # found" — which reads like a broken gate rather than a typo.
+        id: owner
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        # Needed if the packages are private (the default for a new package —
+        # see README). Public packages pull fine without this, but leaving it
+        # in means the pipeline works either way.
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy gate (HIGH + CRITICAL block the release)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ghcr.io/${{ steps.owner.outputs.owner }}/template-app-${{ matrix.image }}:${{ env.IMAGE_TAG }}
+          scanners: vuln
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore.yaml
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------------
+  # Stage 2 — dev. Deliberately ungated.
+  # ------------------------------------------------------------------
+  deploy-dev:
+    name: Deploy to dev
+    runs-on: ubuntu-latest
+    needs: scan-images
+    # `environment:` does two things at once: it selects which set of
+    # variables and secrets `vars.*`/`secrets.*` resolve from below, and it
+    # applies whatever protection rules that environment has in the repo
+    # settings. The dev environment has NO required reviewers configured —
+    # that is a deliberate choice, not an omission. Dev exists to be broken
+    # quickly and often; putting a human in front of it just teaches people
+    # to click approve without reading, which is exactly the habit that makes
+    # the prod gate worthless later.
+    environment:
+      name: dev
+      url: ${{ vars.APP_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/ssh-deploy
+        with:
+          # These resolve from the "dev" environment's variables/secrets —
+          # same expression as the prod job below, different values.
+          user: ${{ vars.DEPLOY_USER }}
+          host: ${{ vars.DEPLOY_HOST }}
+          known_hosts: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+  # ------------------------------------------------------------------
+  # Gate 2 — does it actually work when deployed?
+  # ------------------------------------------------------------------
+  integration-test:
+    name: Integration test against dev
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    # Reads dev's APP_URL. Note this job does NOT deploy anything — it only
+    # needs the environment for its URL, and it inherits dev's (absent)
+    # protection rules, so it costs nothing to gate it here.
+    environment:
+      name: dev
+      url: ${{ vars.APP_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install -r tests/integration/requirements.txt
+
+      - name: Run integration tests
+        # Black-box: these tests talk HTTP to the deployed app through nginx,
+        # exactly like a browser would. That is the point — the backend unit
+        # tests in backend/tests/ already passed in CI against an in-process
+        # app, and they still pass when nginx's proxy config is wrong, when
+        # the image failed to pull, or when the two containers cannot see
+        # each other. Every one of those is a real deploy failure that only a
+        # test against the running system can catch.
+        env:
+          BASE_URL: ${{ vars.APP_URL }}
+        run: pytest tests/integration -v
+
+  # ------------------------------------------------------------------
+  # Stage 3 — prod. Human approval required.
+  # ------------------------------------------------------------------
+  deploy-prod:
+    name: Deploy to prod
+    runs-on: ubuntu-latest
+    # needs: integration-test transitively requires scan-images and
+    # deploy-dev too, so the approval prompt only ever appears for a build
+    # that already passed the scan and works on dev. Ordering matters: asking
+    # a human to approve something the machine has not finished checking
+    # wastes the one gate that cannot be automated.
+    needs: integration-test
+    # This is the approval gate. It is not configured here — it comes from
+    # the repo's Settings -> Environments -> prod -> "Required reviewers".
+    # When that is set, this job pauses and the run sits at "Waiting" until a
+    # named human approves it in the UI. See README.md for the exact setup,
+    # and security/README.md for why the gate sits here and not earlier.
+    environment:
+      name: prod
+      url: ${{ vars.APP_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/ssh-deploy
+        with:
+          # Identical expressions to deploy-dev. Different machine, different
+          # host key, different deploy key — all of it comes from the prod
+          # environment's own variables and secrets. A key that can reach
+          # prod is never exposed to a dev-only job, because environment
+          # secrets are only readable by jobs that declare that environment.
+          user: ${{ vars.DEPLOY_USER }}
+          host: ${{ vars.DEPLOY_HOST }}
+          known_hosts: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
