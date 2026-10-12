@@ -13,3 +13,4 @@ pytest-cov==6.0.0
 # every test run.
 httpx2==2.12.0
 ruff==0.8.4
+PyYAML==5.3.1
