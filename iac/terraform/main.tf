@@ -5,8 +5,12 @@
 
 # SSH keypair imported from your local public key so `terraform apply`
 # never generates or stores a private key.
+locals {
+  name_prefix = "${var.instance_name}-${var.environment}"
+}
+
 resource "openstack_compute_keypair_v2" "this" {
-  name       = "${var.instance_name}-key"
+  name       = "${local.name_prefix}-key"
   public_key = file(pathexpand(var.ssh_public_key_path))
 }
 
@@ -16,7 +20,7 @@ resource "openstack_compute_keypair_v2" "this" {
 # OpenStack's own default rules already allow all egress. The group is
 # applied to the VM's network port below, not to the instance.
 resource "openstack_networking_secgroup_v2" "this" {
-  name        = "${var.instance_name}-sg"
+  name        = "${local.name_prefix}-sg"
   description = "template-app: SSH + app port (M8, cPouta)"
 }
 
@@ -61,7 +65,7 @@ data "openstack_networking_network_v2" "this" {
 # The security group therefore has to sit on the PORT: with an explicit
 # port, the instance's own `security_groups` attribute no longer applies.
 resource "openstack_networking_port_v2" "this" {
-  name               = "${var.instance_name}-port"
+  name               = "${local.name_prefix}-port"
   network_id         = data.openstack_networking_network_v2.this.id
   admin_state_up     = true
   security_group_ids = [openstack_networking_secgroup_v2.this.id]
@@ -85,7 +89,7 @@ resource "openstack_networking_floatingip_v2" "this" {
 # it installs Docker and starts the app's docker-compose stack from GHCR
 # on first boot, no SSH required.
 resource "openstack_compute_instance_v2" "this" {
-  name              = var.instance_name
+  name              = local.name_prefix
   image_name        = var.image_name
   flavor_name       = var.flavor_name
   key_pair          = openstack_compute_keypair_v2.this.name
@@ -98,6 +102,13 @@ resource "openstack_compute_instance_v2" "this" {
   user_data = templatefile("${path.module}/../cloud-init/user-data.yaml.tpl", {
     ghcr_owner = var.ghcr_owner
   })
+
+  lifecycle {
+    precondition {
+      condition     = terraform.workspace == var.environment
+      error_message = "Workspace \"${terraform.workspace}\" does not match environment \"${var.environment}\". Run: terraform workspace select ${var.environment}"
+    }
+  }
 }
 
 # Association kept as its own resource (instead of a `floating_ip` field on
