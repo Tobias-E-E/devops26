@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Patch OS packages at build time: fixable CVEs land in the base image
 # continuously and upstream doesn't always rebuild on the same day. The
